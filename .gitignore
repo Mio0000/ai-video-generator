@@ -1,0 +1,22 @@
+node_modules/
+.env
+out/
+
+# 生成されたAIアセット（サイズが大きいため）
+public/test-ai/*.mp4
+public/test-ai/*.mp3
+
+# 他の生成アセット
+public/audio/narration/*.mp3
+
+# ホラーパイプライン生成ファイル
+public/horror/
+horror_props.json
+horror_history.json
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
