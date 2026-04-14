@@ -4,7 +4,9 @@ horror_pipeline.py — 2ちゃん怖い話 → 英語ホラー動画 全自動�
 
 フロー:
   2ちゃんスクレイプ → 英訳 → Claudeでスクリプト構造化
-  → Pexels画像取得(無料) → gTTS音声生成(無料)
+  → Pollinations.ai でAI画像生成(無料・APIキー不要)
+  → ffmpegでズーム+ノイズ+ビネット効果をかけてMP4化(無料)
+  → gTTS音声生成(無料)
   → Remotionで動画レンダリング(無料)
 
 使い方:
@@ -12,6 +14,7 @@ horror_pipeline.py — 2ちゃん怖い話 → 英語ホラー動画 全自動�
   python horror_pipeline.py --dry-run              # レンダリング省略テスト
   python horror_pipeline.py --story "手動テキスト"  # 直接テキスト指定
   python horror_pipeline.py --voice elevenlabs     # ElevenLabsで高品質音声
+  python horror_pipeline.py --animate svd          # SVD切替（将来実装）
 """
 
 import argparse
@@ -36,14 +39,30 @@ load_dotenv(ROOT / ".env")
 load_dotenv(BEAST_ROOT / ".env", override=False)
 
 # ── 設定 ──────────────────────────────────────────────────────────────────
-PEXELS_API_KEY      = os.getenv("PEXELS_API_KEY", "")
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 
-PUBLIC_DIR  = ROOT / "public" / "horror"
-OUT_DIR     = ROOT / "out"
-PROPS_FILE  = ROOT / "horror_props.json"
+PUBLIC_DIR   = ROOT / "public" / "horror"
+OUT_DIR      = ROOT / "out"
+PROPS_FILE   = ROOT / "horror_props.json"
 HISTORY_FILE = ROOT / "horror_history.json"
+
+# Pollinations.ai（APIキー不要の無料AI画像生成）
+POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}?width=1920&height=1080&model=flux&nologo=true&enhance=true"
+
+# ホラー画像プロンプトのベーススタイル（Flux向け）
+HORROR_IMAGE_STYLE = (
+    ", cinematic horror photography, dark atmosphere, volumetric fog, "
+    "film grain, high contrast shadows, photorealistic, 8k, masterpiece"
+)
+
+# セクションタイプごとのフォールバック画像プロンプト
+FALLBACK_IMAGE_PROMPTS = {
+    "hook":      "dark abandoned japanese torii gate at night, eerie red lanterns, thick fog",
+    "setting":   "empty dark japanese temple corridor, moonlight shadows, abandoned",
+    "event":     "ghostly figure silhouette in dark forest japan, supernatural mist, horror",
+    "end":       "lonely foggy road through japanese bamboo forest at night, unsettling",
+}
 
 # 2ちゃん系怖い話まとめRSS
 RSS_FEEDS = [
@@ -56,15 +75,6 @@ HORROR_KEYWORDS = [
     "怖い", "都市伝説", "心霊", "幽霊", "呪い", "不思議", "謎",
     "事件", "ミステリー", "オカルト", "霊", "異世界", "禁忌",
 ]
-
-# セクションタイプごとのPexels検索クエリ候補
-PEXELS_QUERIES = {
-    "hook":      ["dark abandoned shrine japan", "horror foggy night japan", "eerie dark forest japan"],
-    "setting":   ["abandoned japanese house dark", "dark corridor empty", "foggy japanese shrine"],
-    "event":     ["dark shadow silhouette horror", "supernatural horror darkness", "ghost shadow dark"],
-    "aftermath": ["lonely dark road japan", "dark abandoned room horror", "foggy empty street night"],
-    "end":       ["dark torii gate fog", "japanese shrine dark mystery", "horror dark japan night"],
-}
 
 # ElevenLabs ホラー向けボイス
 ELEVENLABS_VOICES = {
@@ -152,7 +162,7 @@ def fetch_body(url: str) -> str:
 
 def scrape_story() -> dict | None:
     """2ちゃんから怖い話を1件取得する。"""
-    print("\n[1/6] 2ちゃんネタ収集中...")
+    print("\n[1/7] 2ちゃんネタ収集中...")
     history = load_history()
     candidates = fetch_rss_candidates(history)
     if not candidates:
@@ -210,9 +220,9 @@ def translate(text: str, src: str = "ja", dest: str = "en") -> str:
 # ══════════════════════════════════════════════════════════════
 
 FALLBACK_SECTION_TYPES = [
-    ("HOOK",      "hook"),
-    ("THE SETTING", "setting"),
-    ("THE EVENT", "event"),
+    ("HOOK",          "hook"),
+    ("THE SETTING",   "setting"),
+    ("THE EVENT",     "event"),
     ("WHAT REMAINED", "end"),
 ]
 
@@ -221,7 +231,7 @@ def split_into_sections_simple(title_en: str, body_en: str) -> list[dict]:
     sentences = re.split(r'(?<=[.!?])\s+', body_en.strip())
     sentences = [s for s in sentences if len(s) > 20]
     if len(sentences) < 4:
-        sentences *= 2  # 短すぎる場合は繰り返す
+        sentences *= 2
 
     n = len(sentences)
     splits = [
@@ -234,12 +244,10 @@ def split_into_sections_simple(title_en: str, body_en: str) -> list[dict]:
     sections = []
     for (caption, qtype), sents in zip(FALLBACK_SECTION_TYPES, splits):
         narration = " ".join(sents[:4])
-        import random
-        queries = PEXELS_QUERIES[qtype]
         sections.append({
-            "caption":    caption,
-            "narration":  narration,
-            "imageQuery": random.choice(queries),
+            "caption":      caption,
+            "narration":    narration,
+            "imagePrompt":  FALLBACK_IMAGE_PROMPTS[qtype],
         })
     return sections
 
@@ -266,27 +274,28 @@ Return ONLY valid JSON (no markdown, no explanation):
   {{
     "caption": "HOOK",
     "narration": "1-2 shocking sentences that grab attention immediately. Start with something unsettling.",
-    "imageQuery": "dark foggy japanese shrine night"
+    "imagePrompt": "dark abandoned japanese torii gate at night, red lanterns fading into fog, eerie silence"
   }},
   {{
     "caption": "THE SETTING",
     "narration": "2-3 sentences establishing the eerie atmosphere and location.",
-    "imageQuery": "abandoned japanese house dark corridor"
+    "imagePrompt": "empty crumbling japanese house interior, moonlight through broken shoji screens, dust and shadows"
   }},
   {{
     "caption": "THE EVENT",
     "narration": "3-4 sentences describing the terrifying event. Build tension.",
-    "imageQuery": "dark shadow silhouette horror"
+    "imagePrompt": "dark forest path japan at midnight, ghostly silhouette between trees, supernatural mist rising"
   }},
   {{
     "caption": "NO EXPLANATION",
     "narration": "1-2 sentences. Leave it unresolved. No happy ending. Something is still wrong.",
-    "imageQuery": "lonely dark road fog japan"
+    "imagePrompt": "lonely foggy road through japanese bamboo forest, single dim streetlight, ominous atmosphere"
   }}
 ]
 
 Rules:
-- imageQuery: simple Pexels search terms, 3-5 words, dark/horror themed
+- imagePrompt: vivid visual scene description for AI image generation (Flux model), 10-20 words
+  Focus on: location, lighting, mood, specific Japanese horror elements (shrine, torii, bamboo, etc.)
 - Keep cultural context vague but mention "Japan" or "Japanese" once
 - Never explain the horror — let it be ambiguous
 - Tone: like the narrator of Lazy Masquerade or Be. Busta"""
@@ -309,55 +318,48 @@ Rules:
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. Pexels画像取得
+# 4. Pollinations.ai 画像生成（APIキー不要・完全無料）
 # ══════════════════════════════════════════════════════════════
 
-def fetch_pexels_image(query: str, out_path: Path, index: int) -> bool:
-    """Pexels APIで画像を検索してダウンロードする。"""
-    if not PEXELS_API_KEY:
-        return False
-    try:
-        resp = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers={"Authorization": PEXELS_API_KEY},
-            params={"query": query, "per_page": 5, "orientation": "landscape"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        photos = resp.json().get("photos", [])
-        if not photos:
-            return False
-        # インデックスで違う写真を選ぶ（同じ写真を使い回さない）
-        photo = photos[index % len(photos)]
-        img_url = photo["src"]["large2x"]
+def fetch_pollinations_image(image_prompt: str, out_path: Path) -> bool:
+    """
+    Pollinations.ai（Fluxモデル）でホラー画像を生成してダウンロードする。
+    APIキー不要。1920x1080 JPEGを返す。
+    """
+    import urllib.parse
 
-        img_resp = requests.get(img_url, timeout=20)
-        img_resp.raise_for_status()
-        out_path.write_bytes(img_resp.content)
-        print(f"  ✅ 画像保存: {out_path.name} ({query})")
-        time.sleep(0.5)
+    full_prompt = image_prompt + HORROR_IMAGE_STYLE
+    encoded    = urllib.parse.quote(full_prompt)
+    url        = POLLINATIONS_URL.format(prompt=encoded)
+
+    print(f"  🎨 AI画像生成中: {image_prompt[:60]}...")
+    try:
+        # Pollinationsは生成に10〜30秒かかることがある
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        if len(resp.content) < 1000:
+            print(f"  ⚠ 画像が小さすぎます（{len(resp.content)}bytes）→ フォールバック")
+            return False
+        out_path.write_bytes(resp.content)
+        print(f"  ✅ AI画像保存: {out_path.name} ({len(resp.content)//1024}KB)")
         return True
     except Exception as e:
-        print(f"  ⚠ Pexels取得失敗 ({query}): {e}")
+        print(f"  ⚠ Pollinations取得失敗: {e}")
         return False
 
 def create_fallback_image(out_path: Path, section_index: int):
-    """Pillowで暗いグラデーション画像を生成する（Pexelsキーなし時のフォールバック）。"""
+    """Pillowで暗いグラデーション画像を生成する（Pollinationsが失敗した場合）。"""
     try:
         from PIL import Image, ImageFilter
-        import random
 
-        # 暗い色のグラデーション（セクションごとに色味を変える）
         colors = [
-            ((5, 2, 8), (20, 10, 25)),    # 深紫
-            ((2, 8, 5), (10, 25, 15)),    # 深緑
-            ((8, 2, 2), (25, 10, 10)),    # 深赤
-            ((2, 5, 8), (10, 15, 25)),    # 深青
+            ((5, 2, 8),  (20, 10, 25)),   # 深紫
+            ((2, 8, 5),  (10, 25, 15)),   # 深緑
+            ((8, 2, 2),  (25, 10, 10)),   # 深赤
+            ((2, 5, 8),  (10, 15, 25)),   # 深青
         ]
         c1, c2 = colors[section_index % len(colors)]
-
-        img = Image.new("RGB", (1920, 1080), c1)
-        # 簡易グラデーション（上から下）
+        img    = Image.new("RGB", (1920, 1080), c1)
         pixels = img.load()
         for y in range(1080):
             ratio = y / 1080
@@ -366,49 +368,147 @@ def create_fallback_image(out_path: Path, section_index: int):
             b = int(c1[2] + (c2[2] - c1[2]) * ratio)
             for x in range(1920):
                 pixels[x, y] = (r, g, b)
-
         img = img.filter(ImageFilter.GaussianBlur(radius=2))
         img.save(out_path, "JPEG", quality=85)
         print(f"  ✅ フォールバック画像生成: {out_path.name}")
     except ImportError:
-        # Pillowもない場合は最小JPEGを書き込む（真っ黒）
-        # 1x1の真っ黒なJPEG（最小バイナリ）を1920x1080にリサイズしたもの
-        _write_minimal_dark_image(out_path)
+        # 最小限の黒JPEGを書き込む
+        out_path.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t"
+            b"\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
+            b"\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xc0"
+            b"\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00"
+            b"\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01"
+            b"\x01\x00\x00?\x00\xfb\xd5\xff\xd9"
+        )
+        print(f"  ✅ 最小フォールバック画像: {out_path.name}")
 
-def _write_minimal_dark_image(out_path: Path):
-    """最小限の暗い画像を書き込む（依存なし）。"""
-    # 最小JPEGヘッダ（1x1黒ピクセル）
-    minimal_jpeg = bytes([
-        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
-        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-        0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
-        0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
-        0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
-        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
-        0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
-        0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
-        0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0A, 0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03,
-        0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
-        0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
-        0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
-        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72,
-        0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
-        0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45,
-        0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
-        0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
-        0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
-        0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3,
-        0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
-        0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
-        0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
-        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4,
-        0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01,
-        0x00, 0x00, 0x3F, 0x00, 0xFB, 0xD5, 0xFF, 0xD9,
-    ])
-    out_path.write_bytes(minimal_jpeg)
+
+# ══════════════════════════════════════════════════════════════
+# 4b. ffmpeg で画像をホラー動画に変換
+# ══════════════════════════════════════════════════════════════
+
+def find_ffmpeg() -> str | None:
+    """ffmpegの実行パスを返す。見つからなければNone。"""
+    import shutil
+    return shutil.which("ffmpeg")
+
+def animate_image_with_ffmpeg(
+    image_path: Path,
+    output_path: Path,
+    duration: float = 5.0,
+) -> bool:
+    """
+    静止画にffmpegでホラーエフェクトをかけてMP4に変換する。
+
+    エフェクト:
+      - zoompan : ゆっくりズームイン（1.0 → 1.12、中央固定）
+      - noise   : フィルムグレイン（時間経過で変化するテンポラルノイズ）
+      - vignette: 画面端を暗くするビネット効果
+      - eq      : 彩度を下げてコントラストを上げるカラーグレード
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        print("  ⚠ ffmpegが見つかりません。brew install ffmpeg でインストールしてください。")
+        return False
+
+    fps    = 30
+    frames = int(duration * fps)
+
+    # ── フィルターチェーン ──────────────────────────────────────
+    # 1. zoompan: 1.0 → 1.12 へゆっくりズーム（中央でパン固定）
+    #    zoom の増分 = (1.12 - 1.0) / frames = 0.12 / frames
+    zoom_delta = 0.12 / frames
+    zoompan = (
+        f"zoompan="
+        f"z='min(zoom+{zoom_delta:.6f},1.12)':"
+        f"d={frames}:"
+        f"x='iw/2-(iw/zoom/2)':"
+        f"y='ih/2-(ih/zoom/2)':"
+        f"s=1920x1080"
+    )
+    # 2. fps を明示的に指定
+    fps_filter = f"fps={fps}"
+    # 3. noise: テンポラルノイズ（フレームごとに変化）
+    #    c0s=輝度ノイズ強度, c1s/c2s=色差ノイズ強度, allf=t=temporal
+    noise = "noise=c0s=18:c1s=6:c2s=6:allf=t"
+    # 4. vignette: PI/4 ≒ 45° ≒ 中程度のビネット
+    vignette = "vignette=PI/4"
+    # 5. eq: 彩度0.55（くすんだ色）、コントラスト1.2（深い黒）、輝度-0.04（暗め）
+    color_grade = "eq=saturation=0.55:contrast=1.2:brightness=-0.04"
+
+    vf = ",".join([zoompan, fps_filter, noise, vignette, color_grade])
+    # ──────────────────────────────────────────────────────────
+
+    cmd = [
+        ffmpeg, "-y",
+        "-loop", "1",
+        "-i",    str(image_path),
+        "-vf",   vf,
+        "-t",    str(duration),
+        "-c:v",  "libx264",
+        "-preset", "fast",
+        "-crf",  "20",
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            size_kb = output_path.stat().st_size // 1024
+            print(f"  ✅ ffmpeg動画化: {output_path.name} ({size_kb}KB, {duration}秒)")
+            return True
+        else:
+            print(f"  ⚠ ffmpeg失敗:\n{result.stderr[-300:]}")
+            return False
+    except subprocess.TimeoutExpired:
+        print("  ⚠ ffmpegタイムアウト（120秒）")
+        return False
+    except Exception as e:
+        print(f"  ⚠ ffmpeg例外: {e}")
+        return False
+
+
+def animate_image(
+    image_path: Path,
+    output_path: Path,
+    duration: float = 5.0,
+    backend: str = "ffmpeg",
+) -> bool:
+    """
+    画像をアニメーション動画に変換するディスパッチャー。
+
+    backend:
+      "ffmpeg" — ローカルffmpegで処理（無料・即時）
+      "svd"    — Stable Video Diffusion（将来実装）
+      "runway" — Runway gen4_turbo I2V（有料）
+
+    SVDへの切替方法:
+      animate_image(..., backend="svd")
+      → animate_image_with_svd() を実装して呼び出すだけでOK
+    """
+    if backend == "ffmpeg":
+        return animate_image_with_ffmpeg(image_path, output_path, duration)
+
+    # ── 将来のバックエンド ──
+    elif backend == "svd":
+        # TODO: animate_image_with_svd(image_path, output_path, duration) を実装
+        print("  ⚠ SVDバックエンドは未実装です。ffmpegにフォールバックします。")
+        return animate_image_with_ffmpeg(image_path, output_path, duration)
+
+    elif backend == "runway":
+        # TODO: animate_image_with_runway(image_path, output_path, duration) を実装
+        print("  ⚠ Runwayバックエンドは未実装です。ffmpegにフォールバックします。")
+        return animate_image_with_ffmpeg(image_path, output_path, duration)
+
+    else:
+        print(f"  ⚠ 不明なバックエンド: {backend} → ffmpegを使用")
+        return animate_image_with_ffmpeg(image_path, output_path, duration)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -472,24 +572,47 @@ def get_audio_duration(path: Path) -> float:
 def build_project_json(
     title_en: str,
     sections_data: list[dict],
-    image_paths: list[Path],
+    video_paths: list[Path],      # ffmpeg / SVD で生成したMP4
     audio_paths: list[Path],
+    image_paths: list[Path] | None = None,  # 動画化失敗時のフォールバック用
 ) -> dict:
-    """Remotion用のproject定義JSONを組み立てる。"""
+    """
+    Remotion用のproject定義JSONを組み立てる。
+
+    各セクションはffmpegで動画化されたMP4を `video` フィールドに設定する。
+    動画化が失敗している場合は `photos` モードにフォールバックする。
+    """
     sections = []
-    for i, (sec, img_path, aud_path) in enumerate(zip(sections_data, image_paths, audio_paths)):
-        dur = get_audio_duration(aud_path) if aud_path.exists() else 8.0
-        # publicフォルダからの相対パス
-        img_rel = str(img_path.relative_to(ROOT / "public"))
+    for i, (sec, vid_path, aud_path) in enumerate(zip(sections_data, video_paths, audio_paths)):
+        dur     = get_audio_duration(aud_path) if aud_path.exists() else 8.0
         aud_rel = str(aud_path.relative_to(ROOT / "public"))
 
-        sections.append({
-            "caption":   sec["caption"],
-            "photos":    [img_rel],
-            "audio":     aud_rel,
-            "narration": sec["narration"],
-            "durSec":    round(dur, 1),
-        })
+        # MP4が正常に生成されているか確認
+        video_ok = vid_path.exists() and vid_path.stat().st_size > 1000
+
+        if video_ok:
+            vid_rel = str(vid_path.relative_to(ROOT / "public"))
+            section = {
+                "caption":   sec["caption"],
+                "video":     vid_rel,          # ← MP4動画を使用
+                "audio":     aud_rel,
+                "narration": sec["narration"],
+                "durSec":    round(dur, 1),
+            }
+        else:
+            # 動画化失敗 → 静止画フォールバック
+            img_path = (image_paths or [])[i] if image_paths and i < len(image_paths) else None
+            img_rel  = str(img_path.relative_to(ROOT / "public")) if img_path and img_path.exists() else ""
+            section  = {
+                "caption":   sec["caption"],
+                "photos":    [img_rel] if img_rel else [],
+                "audio":     aud_rel,
+                "narration": sec["narration"],
+                "durSec":    round(dur, 1),
+            }
+            print(f"  ⚠ セクション{i+1}: 動画化失敗 → 静止画モードで代替")
+
+        sections.append(section)
 
     return {
         "project": {
@@ -515,6 +638,10 @@ def parse_args():
     p.add_argument("--voice",    default="gtts",      help="音声エンジン: gtts (無料) | elevenlabs")
     p.add_argument("--el-voice", default=DEFAULT_ELEVENLABS_VOICE,
                    help=f"ElevenLabsボイス: {', '.join(ELEVENLABS_VOICES.keys())}")
+    p.add_argument("--animate",  default="ffmpeg",
+                   help="動画化バックエンド: ffmpeg (無料) | svd (将来実装) | runway (有料)")
+    p.add_argument("--clip-duration", type=float, default=5.0,
+                   help="各クリップの秒数（デフォルト: 5.0秒）")
     return p.parse_args()
 
 def find_npm_bin() -> str:
@@ -565,7 +692,7 @@ def main():
 
     # ─ Step 1: ストーリー取得 ─
     if args.story:
-        print("\n[1/6] 手動ストーリーを使用")
+        print("\n[1/7] 手動ストーリーを使用")
         story = {
             "title":  args.title or "A Strange Story from Japan",
             "body":   args.story,
@@ -582,45 +709,64 @@ def main():
     body_ja  = story["body"][:3000]
 
     # ─ Step 2: 英訳 ─
-    print("\n[2/6] 英訳中...")
+    print("\n[2/7] 英訳中...")
     title_en = translate(title_ja)
     body_en  = translate(body_ja)
     print(f"  タイトル: {title_en[:60]}")
     print(f"  本文: {len(body_en)}文字")
 
     # ─ Step 3: スクリプト構造化 ─
-    print("\n[3/6] ホラースクリプト生成中...")
+    print("\n[3/7] ホラースクリプト生成中...")
     sections_data = generate_script_with_claude(title_en, body_en)
     print(f"  ✅ {len(sections_data)}セクション生成")
     for s in sections_data:
         print(f"    [{s['caption']}] {s['narration'][:60]}...")
 
     # ─ 出力ディレクトリ準備 ─
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_dir = PUBLIC_DIR / timestamp
     session_dir.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(exist_ok=True)
 
-    # ─ Step 4: 画像取得 ─
-    print("\n[4/6] ホラー画像取得中...")
-    if not PEXELS_API_KEY:
-        print("  ℹ PEXELS_API_KEY未設定 → フォールバック画像を生成")
-        print("    (無料キー取得: https://www.pexels.com/api/)")
+    # ─ Step 4: AI画像生成（Pollinations.ai） ─
+    print("\n[4/7] AI画像生成中（Pollinations.ai・Fluxモデル）...")
+    print("  ℹ APIキー不要。1枚あたり10〜30秒かかります。")
 
     image_paths = []
     for i, sec in enumerate(sections_data):
-        img_path = session_dir / f"img_{i+1:02d}.jpg"
-        query = sec.get("imageQuery", "dark horror")
-        ok = fetch_pexels_image(query, img_path, i)
+        img_path   = session_dir / f"img_{i+1:02d}.jpg"
+        img_prompt = sec.get("imagePrompt", "dark abandoned japanese shrine")
+        ok = fetch_pollinations_image(img_prompt, img_path)
         if not ok:
+            print(f"  → フォールバック画像を生成")
             create_fallback_image(img_path, i)
         image_paths.append(img_path)
+        time.sleep(4)  # Pollinationsのレート制限対策（429回避）
 
-    # ─ Step 5: 音声生成 ─
-    print(f"\n[5/6] 音声生成中 ({args.voice})...")
+    # ─ Step 5: ffmpegで動画化 ─
+    print(f"\n[5/7] 画像をMP4動画に変換中（backend={args.animate}）...")
+    if not find_ffmpeg():
+        print("  ⚠ ffmpegが見つかりません")
+        print("    インストール: brew install ffmpeg")
+
+    video_paths = []
+    for i, img_path in enumerate(image_paths):
+        vid_path = session_dir / f"clip_{i+1:02d}.mp4"
+        ok = animate_image(
+            image_path=img_path,
+            output_path=vid_path,
+            duration=args.clip_duration,
+            backend=args.animate,
+        )
+        if not ok:
+            print(f"  ⚠ 動画化失敗 → 静止画モードで代替（セクション{i+1}）")
+        video_paths.append(vid_path)
+
+    # ─ Step 6: 音声生成 ─
+    print(f"\n[6/7] 音声生成中 ({args.voice})...")
     audio_paths = []
     for i, sec in enumerate(sections_data):
-        aud_path = session_dir / f"nar_{i+1:02d}.mp3"
+        aud_path  = session_dir / f"nar_{i+1:02d}.mp3"
         narration = sec["narration"]
 
         ok = False
@@ -630,15 +776,16 @@ def main():
             ok = generate_audio_gtts(narration, aud_path)
         if not ok:
             print(f"  ❌ 音声生成失敗: セクション{i+1}")
-            # ダミー用の空MP3を作成
             aud_path.write_bytes(b"")
 
         audio_paths.append(aud_path)
         time.sleep(0.5)
 
-    # ─ Step 6: project.json生成 ─
-    print("\n[6/6] project.json生成中...")
-    project = build_project_json(title_en, sections_data, image_paths, audio_paths)
+    # ─ Step 7: project.json生成 ─
+    print("\n[7/7] project.json生成中...")
+    project = build_project_json(
+        title_en, sections_data, video_paths, audio_paths, image_paths
+    )
     PROPS_FILE.write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"  ✅ {PROPS_FILE}")
 
@@ -649,7 +796,8 @@ def main():
     total_dur = sum(s["durSec"] for s in project["project"]["sections"])
     print(f"  総尺: {total_dur:.1f}秒")
     for s in project["project"]["sections"]:
-        print(f"  [{s['caption']}] {s['durSec']}秒 | {s['narration'][:50]}...")
+        mode = "video" if "video" in s else "photo"
+        print(f"  [{s['caption']}] {s['durSec']}秒 [{mode}] | {s['narration'][:45]}...")
     print("─" * 60)
 
     if args.dry_run:
